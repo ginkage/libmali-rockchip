@@ -42,6 +42,10 @@
 #include <X11/Xlibint.h>
 #endif
 
+#ifdef HAS_VULKAN
+#include <vulkan/vulkan.h>
+#endif
+
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 #endif
@@ -112,6 +116,10 @@ static EGLBoolean (* _eglDestroySurface)(EGLDisplay dpy, EGLSurface surface) = N
 static PFNEGLMAKECURRENTPROC _eglMakeCurrent = NULL;
 #endif
 
+#ifdef HAS_VULKAN
+static PFN_vkVoidFunction (* _vk_icdGetInstanceProcAddr)(VkInstance instance, const char* pName) = NULL;
+#endif
+
 #define MALI_SYMBOL(func) { #func, (void **)(&_ ## func), }
 static struct {
    const char *func;
@@ -165,6 +173,9 @@ static struct {
    MALI_SYMBOL(eglCreateWindowSurface),
    MALI_SYMBOL(eglDestroySurface),
    MALI_SYMBOL(eglMakeCurrent),
+#endif
+#ifdef HAS_VULKAN
+   MALI_SYMBOL(vk_icdGetInstanceProcAddr),
 #endif
 };
 
@@ -859,3 +870,25 @@ eglGetProcAddress(const char *procname)
 }
 
 #endif // HAS_EGL
+
+#ifdef HAS_VULKAN
+static PFN_vkGetDeviceProcAddr _vkGetDeviceProcAddr = NULL;
+static VkInstance _vk_instance;
+
+void* myGetDeviceProcAddr(VkDevice device, const char* pName) {
+   void *addr = _vkGetDeviceProcAddr(device, pName);
+   if (addr == NULL)
+      addr = _vk_icdGetInstanceProcAddr(_vk_instance, pName);
+   return addr;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char* pName) {
+   void *addr = _vk_icdGetInstanceProcAddr(instance, pName);
+   if (!strcmp(pName, "vkGetDeviceProcAddr")) {
+      _vk_instance = instance;
+      _vkGetDeviceProcAddr = addr;
+      return (PFN_vkVoidFunction)myGetDeviceProcAddr;
+   }
+   return addr;
+}
+#endif
