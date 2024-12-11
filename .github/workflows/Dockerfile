@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext-dev \
     libxfixes3 \
     libxfixes-dev \
+    libvulkan-dev \
     libwayland-client0 \
     libwayland-dev \
  && apt-get clean autoclean --yes \
