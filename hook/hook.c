@@ -878,17 +878,17 @@ static VkInstance _vk_instance = NULL;
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char* pName) {
    void *addr = _vk_icdGetPhysicalDeviceProcAddr(instance, pName);
-   if (addr == NULL)
-      addr = _vk_icdGetInstanceProcAddr(_vk_instance, pName);
+   //if (addr == NULL)
+   //   addr = _vk_icdGetInstanceProcAddr(_vk_instance, pName);
    return addr;
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char* pName) {
    void *addr = _vk_icdGetInstanceProcAddr(instance, pName);
-   if (!strcmp(pName, "vkGetDeviceProcAddr")) {
-      _vk_instance = instance;
-      return (PFN_vkVoidFunction)vk_icdGetPhysicalDeviceProcAddr;
-   }
+   //if (!strcmp(pName, "vkGetDeviceProcAddr")) {
+   //   _vk_instance = instance;
+   //   return (PFN_vkVoidFunction)vk_icdGetPhysicalDeviceProcAddr;
+   //}
    return addr;
 }
 #endif
