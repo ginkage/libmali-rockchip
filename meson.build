@@ -1,5 +1,5 @@
 project(
-  'libmali', 'c',
+  'libmali', ['c', 'cpp'],
   version : '1.9.0',
   meson_version : '>=0.53.0')
 
@@ -9,6 +9,7 @@ fs = import('fs')
 pkgconfig = import('pkgconfig')
 
 cc = meson.get_compiler('c')
+cxx = meson.get_compiler('cpp')
 
 if get_option('arch') != 'auto'
   arch = get_option('arch')

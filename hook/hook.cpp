@@ -16,6 +16,9 @@
 #define _GNU_SOURCE 1
 #endif
 
+#include <unordered_map>
+#include <string>
+
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -42,6 +45,10 @@
 #include <X11/Xlibint.h>
 #endif
 
+#ifdef HAS_VULKAN
+#include <vulkan/vulkan.h>
+#endif
+
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 #endif
@@ -53,6 +60,8 @@
 #ifndef DRM_FORMAT_MOD_INVALID
 #define DRM_FORMAT_MOD_INVALID ((1ULL<<56) - 1)
 #endif
+
+extern "C" {
 
 /* A stub symbol to ensure that the hook library would not be removed as unused */
 int mali_injected = 0;
@@ -112,6 +121,11 @@ static EGLBoolean (* _eglDestroySurface)(EGLDisplay dpy, EGLSurface surface) = N
 static PFNEGLMAKECURRENTPROC _eglMakeCurrent = NULL;
 #endif
 
+#ifdef HAS_VULKAN
+static PFN_vkVoidFunction (* _vk_icdGetInstanceProcAddr)(VkInstance instance, const char* pName) = NULL;
+static PFN_vkVoidFunction (* _vk_icdGetPhysicalDeviceProcAddr)(VkInstance instance, const char* pName) = NULL;
+#endif
+
 #define MALI_SYMBOL(func) { #func, (void **)(&_ ## func), }
 static struct {
    const char *func;
@@ -166,13 +180,17 @@ static struct {
    MALI_SYMBOL(eglDestroySurface),
    MALI_SYMBOL(eglMakeCurrent),
 #endif
+#ifdef HAS_VULKAN
+   MALI_SYMBOL(vk_icdGetInstanceProcAddr),
+   MALI_SYMBOL(vk_icdGetPhysicalDeviceProcAddr),
+#endif
 };
 
 __attribute__((constructor)) static void
 load_mali_symbols(void)
 {
    void *handle, *symbol;
-   int i;
+   unsigned int i;
 
    /* The libmali should be already loaded */
    handle = dlopen(LIBMALI_SO, RTLD_LAZY | RTLD_NOLOAD);
@@ -218,7 +236,7 @@ __attribute__((unused)) static inline bool
 can_ignore_modifiers(const uint64_t *modifiers,
                      const unsigned int count)
 {
-   for (int i = 0; i < count; i++) {
+   for (unsigned int i = 0; i < count; i++) {
       if (modifiers[i] == DRM_FORMAT_MOD_LINEAR ||
           modifiers[i] == DRM_FORMAT_MOD_INVALID) {
          return true;
@@ -631,7 +649,7 @@ eglGetPlatformDisplayEXT (EGLenum platform, void *native_display, const EGLint *
       return EGL_NO_DISPLAY;
 
    if (platform == EGL_PLATFORM_X11_KHR && native_display) {
-      native_display = (void *)fixup_x11_display(native_display);
+      native_display = (void *)fixup_x11_display((Display *)native_display);
       if (!native_display)
          return EGL_NO_DISPLAY;
    }
@@ -699,7 +717,7 @@ _eglConvertAttribsToInt(const EGLAttrib *attr_list)
 
    /* Convert attributes from EGLAttrib[] to EGLint[] */
    if (size) {
-      int_attribs = calloc(size, sizeof(int_attribs[0]));
+      int_attribs = (EGLint *)calloc(size, sizeof(int_attribs[0]));
       if (!int_attribs)
          return NULL;
 
@@ -727,7 +745,7 @@ eglGetPlatformDisplay(EGLenum platform, void *native_display, const EGLAttrib *a
 
 #ifdef HAS_X11
    if (platform == EGL_PLATFORM_X11_KHR && native_display) {
-      native_display = (void *)fixup_x11_display(native_display);
+      native_display = (void *)fixup_x11_display((Display *)native_display);
       if (!native_display)
          return EGL_NO_DISPLAY;
    }
@@ -767,7 +785,7 @@ eglCreatePlatformPixmapSurface(EGLDisplay dpy, EGLConfig config, void *native_pi
       EGLint *int_attribs = _eglConvertAttribsToInt(attrib_list);
       if (!int_attribs == !attrib_list) {
          EGLSurface surface =
-            _eglCreatePixmapSurface(dpy, config, native_pixmap, int_attribs);
+            _eglCreatePixmapSurface(dpy, config, (gbm_bo *)native_pixmap, int_attribs);
          free(int_attribs);
          return surface;
       }
@@ -859,3 +877,417 @@ eglGetProcAddress(const char *procname)
 }
 
 #endif // HAS_EGL
+
+#ifdef HAS_VULKAN
+
+static inline uint32_t PackRGBA(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return ((a << 24) | (b << 16) | (g << 8) | r);
+}
+
+void DecompressBlockDXT1(uint32_t x, uint32_t y, uint32_t width, const uint8_t *blockStorage, uint32_t *image) {
+    uint16_t color0 = *(uint16_t *)(blockStorage);
+    uint16_t color1 = *(uint16_t *)(blockStorage + 2);
+
+    uint32_t temp;
+
+    temp = (color0 >> 11) * 255 + 16;
+    uint8_t r0 = (uint8_t)((temp/32 + temp)/32);
+    temp = ((color0 & 0x07E0) >> 5) * 255 + 32;
+    uint8_t g0 = (uint8_t)((temp/64 + temp)/64);
+    temp = (color0 & 0x001F) * 255 + 16;
+    uint8_t b0 = (uint8_t)((temp/32 + temp)/32);
+
+    temp = (color1 >> 11) * 255 + 16;
+    uint8_t r1 = (uint8_t)((temp/32 + temp)/32);
+    temp = ((color1 & 0x07E0) >> 5) * 255 + 32;
+    uint8_t g1 = (uint8_t)((temp/64 + temp)/64);
+    temp = (color1 & 0x001F) * 255 + 16;
+    uint8_t b1 = (uint8_t)((temp/32 + temp)/32);
+
+    uint32_t code = *(uint32_t *)(blockStorage + 4);
+
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            uint32_t finalColor = 0;
+            uint8_t positionCode = (code >> 2*(4*j+i)) & 0x03;
+
+            if (color0 > color1)
+                switch (positionCode) {
+                case 0:
+                    finalColor = PackRGBA(r0, g0, b0, 255);
+                    break;
+                case 1:
+                    finalColor = PackRGBA(r1, g1, b1, 255);
+                    break;
+                case 2:
+                    finalColor = PackRGBA((2*r0+r1)/3, (2*g0+g1)/3, (2*b0+b1)/3, 255);
+                    break;
+                case 3:
+                    finalColor = PackRGBA((r0+2*r1)/3, (g0+2*g1)/3, (b0+2*b1)/3, 255);
+                    break;
+                }
+            else
+                switch (positionCode) {
+                case 0:
+                    finalColor = PackRGBA(r0, g0, b0, 255);
+                    break;
+                case 1:
+                    finalColor = PackRGBA(r1, g1, b1, 255);
+                    break;
+                case 2:
+                    finalColor = PackRGBA((r0+r1)/2, (g0+g1)/2, (b0+b1)/2, 255);
+                    break;
+                case 3:
+                    finalColor = PackRGBA(0, 0, 0, 255);
+                    break;
+                }
+
+            if (x + i < width)
+                image[(y + j)*width + (x + i)] = finalColor;
+        }
+    }
+}
+
+void BlockDecompressImageDXT1(uint32_t width, uint32_t height, const uint8_t *blockStorage, uint32_t *image) {
+    uint32_t blockCountX = (width + 3) / 4;
+    uint32_t blockCountY = (height + 3) / 4;
+    for (uint32_t j = 0; j < blockCountY; j++) {
+        for (uint32_t i = 0; i < blockCountX; i++)
+            DecompressBlockDXT1(i*4, j*4, width, blockStorage + i * 8, image);
+        blockStorage += blockCountX * 8;
+    }
+}
+
+void DecompressBlockDXT5(uint32_t x, uint32_t y, uint32_t width, const uint8_t *blockStorage, uint32_t *image) {
+    uint8_t alpha0 = *(uint8_t *)(blockStorage);
+    uint8_t alpha1 = *(uint8_t *)(blockStorage + 1);
+
+    const uint8_t *bits = blockStorage + 2;
+    uint32_t alphaCode1 = bits[2] | (bits[3] << 8) | (bits[4] << 16) | (bits[5] << 24);
+    uint16_t alphaCode2 = bits[0] | (bits[1] << 8);
+
+    uint16_t color0 = *(uint16_t *)(blockStorage + 8);
+    uint16_t color1 = *(uint16_t *)(blockStorage + 10);
+
+    uint32_t temp;
+
+    temp = (color0 >> 11) * 255 + 16;
+    uint8_t r0 = (uint8_t)((temp/32 + temp)/32);
+    temp = ((color0 & 0x07E0) >> 5) * 255 + 32;
+    uint8_t g0 = (uint8_t)((temp/64 + temp)/64);
+    temp = (color0 & 0x001F) * 255 + 16;
+    uint8_t b0 = (uint8_t)((temp/32 + temp)/32);
+
+    temp = (color1 >> 11) * 255 + 16;
+    uint8_t r1 = (uint8_t)((temp/32 + temp)/32);
+    temp = ((color1 & 0x07E0) >> 5) * 255 + 32;
+    uint8_t g1 = (uint8_t)((temp/64 + temp)/64);
+    temp = (color1 & 0x001F) * 255 + 16;
+    uint8_t b1 = (uint8_t)((temp/32 + temp)/32);
+
+    uint32_t code = *(uint32_t *)(blockStorage + 12);
+
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            int alphaCodeIndex = 3*(4*j+i);
+            int alphaCode;
+
+            if (alphaCodeIndex <= 12)
+                alphaCode = (alphaCode2 >> alphaCodeIndex) & 0x07;
+            else if (alphaCodeIndex == 15)
+                alphaCode = (alphaCode2 >> 15) | ((alphaCode1 << 1) & 0x06);
+            else // alphaCodeIndex >= 18 && alphaCodeIndex <= 45
+                alphaCode = (alphaCode1 >> (alphaCodeIndex - 16)) & 0x07;
+
+            uint8_t finalAlpha;
+            if (alphaCode == 0)
+                finalAlpha = alpha0;
+            else if (alphaCode == 1)
+                finalAlpha = alpha1;
+            else if (alpha0 > alpha1)
+                finalAlpha = ((8-alphaCode)*alpha0 + (alphaCode-1)*alpha1)/7;
+            else if (alphaCode == 6)
+                finalAlpha = 0;
+            else if (alphaCode == 7)
+                finalAlpha = 255;
+            else
+                finalAlpha = ((6-alphaCode)*alpha0 + (alphaCode-1)*alpha1)/5;
+
+            uint8_t colorCode = (code >> 2*(4*j+i)) & 0x03;
+
+            uint32_t finalColor;
+            switch (colorCode) {
+                case 0:
+                    finalColor = PackRGBA(r0, g0, b0, finalAlpha);
+                    break;
+                case 1:
+                    finalColor = PackRGBA(r1, g1, b1, finalAlpha);
+                    break;
+                case 2:
+                    finalColor = PackRGBA((2*r0+r1)/3, (2*g0+g1)/3, (2*b0+b1)/3, finalAlpha);
+                    break;
+                case 3:
+                    finalColor = PackRGBA((r0+2*r1)/3, (g0+2*g1)/3, (b0+2*b1)/3, finalAlpha);
+                    break;
+            }
+
+            if (x + i < width)
+                image[(y + j)*width + (x + i)] = finalColor;
+        }
+    }
+}
+
+void BlockDecompressImageDXT5(uint32_t width, uint32_t height, const uint8_t *blockStorage, uint32_t *image) {
+    uint32_t blockCountX = (width + 3) / 4;
+    uint32_t blockCountY = (height + 3) / 4;
+    for (uint32_t j = 0; j < blockCountY; j++) {
+        for (uint32_t i = 0; i < blockCountX; i++)
+            DecompressBlockDXT5(i*4, j*4, width, blockStorage + i * 16, image);
+        blockStorage += blockCountX * 16;
+    }
+}
+
+// #define VK_LOG(fmt, ...) do { fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+
+#define VK_LOG(fmt, ...)
+
+static PFN_vkGetDeviceProcAddr _vkGetDeviceProcAddr = NULL;
+static PFN_vkCmdCopyBufferToImage _vkCmdCopyBufferToImage = NULL;
+static PFN_vkMapMemory _vkMapMemory = NULL;
+static PFN_vkUnmapMemory _vkUnmapMemory = NULL;
+static PFN_vkCreateBuffer _vkCreateBuffer = NULL;
+static PFN_vkGetBufferMemoryRequirements _vkGetBufferMemoryRequirements = NULL;
+static PFN_vkAllocateMemory _vkAllocateMemory = NULL;
+static PFN_vkBindBufferMemory _vkBindBufferMemory = NULL;
+static PFN_vkCreateImage _vkCreateImage = NULL;
+static PFN_vkGetPhysicalDeviceMemoryProperties _vkGetPhysicalDeviceMemoryProperties = NULL;
+static PFN_vkDestroyBuffer _vkDestroyBuffer = NULL;
+static PFN_vkFreeMemory _vkFreeMemory = NULL;
+static PFN_vkCreateImageView _vkCreateImageView = NULL;
+static PFN_vkDestroyImage _vkDestroyImage = NULL;
+
+typedef struct {
+   VkDeviceMemory memory;
+   size_t memoryOffset;
+} buffer_data;
+
+std::unordered_map<VkDeviceMemory, uint8_t *> memory_map;
+std::unordered_map<VkBuffer, buffer_data> buffer_map;
+std::unordered_map<VkImage, VkFormat> image_map;
+
+static VkDevice _device = NULL;
+VkPhysicalDeviceMemoryProperties _memProperties;
+
+void my_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties* pMemoryProperties) {
+   _vkGetPhysicalDeviceMemoryProperties(physicalDevice, pMemoryProperties);
+   _memProperties = *pMemoryProperties;
+}
+
+void my_vkCmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount, const VkBufferImageCopy* pRegions) {
+   auto it = image_map.find(dstImage);
+   if (it == image_map.end()) {
+      _vkCmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions);
+      return;
+   }
+
+   buffer_data &buf = buffer_map[srcBuffer];
+   uint8_t *src_data = memory_map[buf.memory] + buf.memoryOffset;
+
+   size_t imageSize = 0;
+   VkBufferImageCopy region[regionCount];
+   for (uint32_t i = 0; i < regionCount; i++) {
+      region[i] = pRegions[i];
+      region[i].bufferOffset = imageSize;
+      imageSize += region[i].imageExtent.width * region[i].imageExtent.height * 4;
+   }
+
+   VkBufferCreateInfo bufferInfo = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = imageSize,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+   };
+   VkBuffer _buffer;
+   if (_vkCreateBuffer(_device, &bufferInfo, NULL, &_buffer) != VK_SUCCESS)
+      fprintf(stderr, "Failed to create buffer\n");
+
+   VkMemoryRequirements memRequirements;
+   _vkGetBufferMemoryRequirements(_device, _buffer, &memRequirements);
+
+   VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   VkMemoryAllocateInfo allocInfo = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = memRequirements.size
+   };
+   for (uint32_t i = 0; i < _memProperties.memoryTypeCount; i++)
+      if ((memRequirements.memoryTypeBits & (1 << i)) && (_memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+         allocInfo.memoryTypeIndex = i;
+         break;
+      }
+
+   VkDeviceMemory _bufferMemory;
+   if (_vkAllocateMemory(_device, &allocInfo, NULL, &_bufferMemory) != VK_SUCCESS)
+      fprintf(stderr, "Failed to allocate memory\n");
+   if (_vkBindBufferMemory(_device, _buffer, _bufferMemory, 0) != VK_SUCCESS)
+      fprintf(stderr, "Failed to bind buffer memory\n");
+
+   uint8_t* _dst_data = NULL;
+   if (_vkMapMemory(_device, _bufferMemory, 0, imageSize, 0, (void **)&_dst_data) != VK_SUCCESS)
+      fprintf(stderr, "Failed to map memory\n");
+
+   for (uint32_t i = 0; i < regionCount; i++) {
+      uint32_t width = region[i].imageExtent.width, height = region[i].imageExtent.height;
+      uint8_t *src = src_data + pRegions[i].bufferOffset;
+      uint8_t *dst = _dst_data + region[i].bufferOffset;
+      if (it->second == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || it->second == VK_FORMAT_BC1_RGBA_SRGB_BLOCK)
+         BlockDecompressImageDXT1(width, height, src, (uint32_t *)dst);
+      else
+         BlockDecompressImageDXT5(width, height, src, (uint32_t *)dst);
+   }
+
+   _vkCmdCopyBufferToImage(commandBuffer, _buffer, dstImage, dstImageLayout, regionCount, region);
+   _vkUnmapMemory(_device, _bufferMemory);
+   _vkDestroyBuffer(_device, _buffer, NULL);
+   _vkFreeMemory(_device, _bufferMemory, NULL);
+}
+
+VkResult my_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void** ppData) {
+   VkResult result = _vkMapMemory(device, memory, offset, size, flags, ppData);
+   memory_map[memory] = (uint8_t *)*ppData;
+   return result;
+}
+
+void my_vkUnmapMemory(VkDevice device, VkDeviceMemory memory) {
+   memory_map.erase(memory);
+   _vkUnmapMemory(device, memory);
+}
+
+VkResult my_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer) {
+   return _vkCreateBuffer(device, pCreateInfo, pAllocator, pBuffer);
+}
+
+void my_vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkMemoryRequirements* pMemoryRequirements) {
+   _vkGetBufferMemoryRequirements(device, buffer, pMemoryRequirements);
+}
+
+VkResult my_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pAllocateInfo, const VkAllocationCallbacks* pAllocator, VkDeviceMemory* pMemory) {
+   return  _vkAllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
+}
+
+VkResult my_vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+   buffer_map[buffer] = { .memory = memory, .memoryOffset = memoryOffset };
+   return  _vkBindBufferMemory(device, buffer, memory, memoryOffset);
+}
+
+VkResult my_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImage* pImage) {
+   _device = device;
+   VkImageCreateInfo myImageCreateInfo = *pCreateInfo;
+   switch (pCreateInfo->format) {
+      case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+	 myImageCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+         break;
+      case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+	 myImageCreateInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+         break;
+      case VK_FORMAT_BC3_UNORM_BLOCK:
+         myImageCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+         break;
+      case VK_FORMAT_BC3_SRGB_BLOCK:
+	 myImageCreateInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+         break;
+      default:
+         break;
+   }
+   VkResult result = _vkCreateImage(device, &myImageCreateInfo, pAllocator, pImage);
+   if (myImageCreateInfo.format != pCreateInfo->format)
+      image_map[*pImage] = pCreateInfo->format;
+   return result;
+}
+
+void my_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
+   image_map.erase(image);
+   _vkDestroyImage(device, image, pAllocator);
+}
+
+VkResult my_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImageView* pView) {
+   VkImageViewCreateInfo myImageViewCreateInfo = *pCreateInfo;
+   switch (pCreateInfo->format) {
+      case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+	 myImageViewCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+         break;
+      case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+	 myImageViewCreateInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+         break;
+      case VK_FORMAT_BC3_UNORM_BLOCK:
+         myImageViewCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+         break;
+      case VK_FORMAT_BC3_SRGB_BLOCK:
+	 myImageViewCreateInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+         break;
+      default:
+         break;
+   }
+   return _vkCreateImageView(device, &myImageViewCreateInfo, pAllocator, pView);
+}
+
+void my_vkDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator) {
+   buffer_map.erase(buffer);
+   _vkDestroyBuffer(device, buffer, pAllocator);
+}
+
+void my_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator) {
+   _vkFreeMemory(device, memory, pAllocator);
+}
+
+PFN_vkVoidFunction my_vkGetDeviceProcAddr(VkDevice device, const char* pName);
+
+static std::unordered_map<std::string, std::pair<PFN_vkVoidFunction, PFN_vkVoidFunction*>> _remap;
+
+static void maybe_init() {
+   if (_remap.size() != 0) return;
+
+#define ADD_VK_SYM(func) _remap[#func] = std::make_pair((PFN_vkVoidFunction)my_ ## func, (PFN_vkVoidFunction*)&_ ##func)
+
+ADD_VK_SYM(vkGetDeviceProcAddr);
+ADD_VK_SYM(vkCmdCopyBufferToImage);
+ADD_VK_SYM(vkMapMemory);
+ADD_VK_SYM(vkUnmapMemory);
+ADD_VK_SYM(vkCreateBuffer);
+ADD_VK_SYM(vkGetBufferMemoryRequirements);
+ADD_VK_SYM(vkAllocateMemory);
+ADD_VK_SYM(vkBindBufferMemory);
+ADD_VK_SYM(vkCreateImage);
+ADD_VK_SYM(vkGetPhysicalDeviceMemoryProperties);
+ADD_VK_SYM(vkDestroyBuffer);
+ADD_VK_SYM(vkFreeMemory);
+ADD_VK_SYM(vkCreateImageView);
+ADD_VK_SYM(vkDestroyImage);
+}
+
+PFN_vkVoidFunction myGetProcAddr(PFN_vkVoidFunction addr, const char* pName) {
+   maybe_init();
+   auto it = _remap.find(pName);
+   if (it != _remap.end()) {
+      *it->second.second = addr;
+      return it->second.first;
+   }
+   return addr;
+}
+
+PFN_vkVoidFunction my_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
+   PFN_vkVoidFunction addr = _vkGetDeviceProcAddr(device, pName);
+   return myGetProcAddr(addr, pName);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char* pName) {
+   PFN_vkVoidFunction addr = _vk_icdGetPhysicalDeviceProcAddr(instance, pName);
+   return myGetProcAddr(addr, pName);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char* pName) {
+   PFN_vkVoidFunction addr = _vk_icdGetInstanceProcAddr(instance, pName);
+   return myGetProcAddr(addr, pName);
+}
+#endif
+
+}

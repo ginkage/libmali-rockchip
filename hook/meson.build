@@ -59,10 +59,14 @@ if cc.has_function('eglCreateContext', dependencies : mali)
   endif
 endif
 
+if cc.has_function('vk_icdGetInstanceProcAddr', dependencies : mali)
+  libhook_cflags += '-DHAS_VULKAN'
+endif
+
 libhook = shared_library(
   'mali-hook',
-  'hook.c',
-  c_args : libhook_cflags,
+  'hook.cpp',
+  cpp_args : libhook_cflags,
   include_directories : libhook_inc,
   dependencies : libhook_dep,
   install : true,
