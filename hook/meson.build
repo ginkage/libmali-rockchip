@@ -18,7 +18,7 @@ gbm_check_funcs = [
 ]
 
 libhook_cflags = [
-  '-DLIBMALI_SO="libmali.so.' + mali_version.split('.')[0] + '"',
+  '-DLIBMALI_SO="libmali.so.' + mali_soname_major + '"',
 ]
 
 libhook_dep = [
@@ -66,7 +66,7 @@ libhook = shared_library(
   dependencies : libhook_dep,
   link_with : libmali,
   install : true,
-  version : mali_version)
+  version : mali_lib_version)
 
 libhook_ldflags = ['-L${libdir}', '-lmali-hook']
 

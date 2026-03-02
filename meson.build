@@ -194,6 +194,21 @@ map = {
   'vulkan' : ['vk_icdGetInstanceProcAddr', vk_wrappers, {}, mali_version],
 }
 
+# Detect the SONAME major version from the prebuilt library so that the dummy
+# and all wrapper libraries link against the same libmali.so.N as the prebuilt.
+# Without this, a prebuilt with SONAME libmali.so.0 would cause dh_shlibdeps to
+# look for a provider of libmali.so.1 (the meson default) outside the package.
+soname_cmd = run_command('sh', '-c',
+  'readelf -d "' + meson.current_source_dir() / default_lib +
+  '" 2>/dev/null | sed -n \'s/.*SONAME.*\\[libmali\\.so\\.\\([0-9]*\\)\\].*/\\1/p\'',
+  check : false)
+mali_soname_major = soname_cmd.stdout().strip()
+if mali_soname_major == '' or mali_soname_major == mali_version.split('.')[0]
+  mali_lib_version = mali_version
+else
+  mali_lib_version = mali_soname_major + '.0.0'
+endif
+
 # Create dummy source for building dummy libraries
 dummy_source = join_paths(meson.current_build_dir(), 'dummy.c')
 run_command('touch', dummy_source, check : false)
@@ -203,7 +218,7 @@ libmali = shared_library(
   'mali',
   dummy_source,
   install : true,
-  version : mali_version)
+  version : mali_lib_version)
 
 libhook = []
 if build_hook
