@@ -59,6 +59,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         
+      - name: Refresh bundled Vulkan WSI layer
+        run: ./scripts/update_wsi.sh
+
       - name: Build Debian package
         run: |
           debuild -us -uc -b && cp -a ../*.deb ./
