@@ -26,7 +26,7 @@
 set -u
 
 # Pinned source artifact (override with $WSI_DEB_URL or the first argument).
-DEFAULT_WSI_DEB_URL="https://github.com/ginkage/vulkan-wsi-layer/releases/download/v1.3.276-1-3636ca6/libvulkan-wsi-layer_1.3.276-1_arm64.deb"
+DEFAULT_WSI_DEB_URL="https://github.com/ginkage/vulkan-wsi-layer/releases/download/v1.3.276-1-5443b80/libvulkan-wsi-layer_1.3.276-1_arm64.deb"
 
 SRC="${1:-${WSI_DEB_URL:-$DEFAULT_WSI_DEB_URL}}"
 WSI_DEB_SHA256="${WSI_DEB_SHA256:-}"
