@@ -77,6 +77,7 @@ static PFNEGLGETPLATFORMDISPLAYPROC _eglGetPlatformDisplay = NULL;
 static PFNEGLCHOOSECONFIGPROC _eglChooseConfig = NULL;
 static EGLBoolean (* _eglDestroySurface)(EGLDisplay dpy, EGLSurface surface) = NULL;
 static PFNEGLMAKECURRENTPROC _eglMakeCurrent = NULL;
+static PFNEGLQUERYSTRINGPROC _eglQueryString = NULL;
 #endif // HAS_EGL
 
 #define MALI_SYMBOL(func) { #func, (void **)(&_ ## func), }
@@ -105,6 +106,7 @@ static struct {
    MALI_SYMBOL(eglChooseConfig),
    MALI_SYMBOL(eglDestroySurface),
    MALI_SYMBOL(eglMakeCurrent),
+   MALI_SYMBOL(eglQueryString),
 #endif // HAS_EGL
 };
 
@@ -342,6 +344,106 @@ EGLBoolean eglChooseConfig (EGLDisplay dpy, const EGLint *attrib_list, EGLConfig
    return _eglChooseConfig(dpy, list, configs, config_size, num_config);
 }
 
+/* Implement EGL_EXT_device_query and EGL_EXT_device_drm(_render_node)
+ *
+ * libmali's EGL has no EGL devices, so a compositor cannot tell which DRM
+ * device its buffers live on: mutter then offers zwp_linux_dmabuf_v1 version 3
+ * only, without the feedback that names its main device, and Mesa's EGL on the
+ * clients cannot find a render node to allocate buffers for them on.
+ *
+ * The Mali GPU itself has no DRM device, but the buffers of every display are
+ * dma-bufs shared through the display controller, so report that one: the
+ * first DRM device that has a render node.
+ */
+
+static struct {
+   bool probed;
+   char primary[64];
+   char render[64];
+} mali_egl_device;
+
+static void
+probe_egl_device(void)
+{
+   drmDevicePtr devices[16];
+   int i, num;
+
+   if (mali_egl_device.probed)
+      return;
+   mali_egl_device.probed = true;
+
+   num = drmGetDevices2(0, devices, ARRAY_SIZE(devices));
+   for (i = 0; i < num; i++) {
+      drmDevicePtr device = devices[i];
+
+      if (!mali_egl_device.render[0] &&
+          (device->available_nodes & (1 << DRM_NODE_RENDER))) {
+         snprintf(mali_egl_device.render, sizeof(mali_egl_device.render),
+                  "%s", device->nodes[DRM_NODE_RENDER]);
+         if (device->available_nodes & (1 << DRM_NODE_PRIMARY))
+            snprintf(mali_egl_device.primary, sizeof(mali_egl_device.primary),
+                     "%s", device->nodes[DRM_NODE_PRIMARY]);
+      }
+      drmFreeDevice(&device);
+   }
+}
+
+static EGLBoolean EGLAPIENTRY
+hook_eglQueryDisplayAttribEXT(EGLDisplay dpy, EGLint attribute,
+                              EGLAttrib *value)
+{
+   probe_egl_device();
+
+   if (dpy == EGL_NO_DISPLAY || attribute != EGL_DEVICE_EXT ||
+       !mali_egl_device.render[0])
+      return EGL_FALSE;
+
+   *value = (EGLAttrib)&mali_egl_device;
+   return EGL_TRUE;
+}
+
+static const char * EGLAPIENTRY
+hook_eglQueryDeviceStringEXT(EGLDeviceEXT device, EGLint name)
+{
+   if (device != (EGLDeviceEXT)&mali_egl_device)
+      return NULL;
+
+   switch (name) {
+   case EGL_EXTENSIONS:
+      return "EGL_EXT_device_drm EGL_EXT_device_drm_render_node";
+   case EGL_DRM_DEVICE_FILE_EXT:
+      return mali_egl_device.primary[0] ? mali_egl_device.primary : NULL;
+   case EGL_DRM_RENDER_NODE_FILE_EXT:
+      return mali_egl_device.render;
+   default:
+      return NULL;
+   }
+}
+
+static EGLBoolean EGLAPIENTRY
+hook_eglQueryDeviceAttribEXT(EGLDeviceEXT device, EGLint attribute,
+                             EGLAttrib *value)
+{
+   return EGL_FALSE;
+}
+
+EGLAPI const char * EGLAPIENTRY
+eglQueryString(EGLDisplay dpy, EGLint name)
+{
+   static char *client_extensions = NULL;
+   const char *str = _eglQueryString(dpy, name);
+
+   if (dpy != EGL_NO_DISPLAY || name != EGL_EXTENSIONS || !str)
+      return str;
+
+   if (!client_extensions &&
+       asprintf(&client_extensions,
+                "%s EGL_EXT_device_base EGL_EXT_device_query", str) < 0)
+      client_extensions = NULL;
+
+   return client_extensions ? client_extensions : str;
+}
+
 /* Override proc addesses */
 
 EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY
@@ -352,6 +454,19 @@ eglGetProcAddress(const char *procname)
 
    if (!strcmp(procname, __func__))
       return (__eglMustCastToProperFunctionPointerType)eglGetProcAddress;
+
+   if (!strcmp(procname, "eglQueryString"))
+      return (__eglMustCastToProperFunctionPointerType)eglQueryString;
+
+   if (!strcmp(procname, "eglQueryDisplayAttribEXT") ||
+       !strcmp(procname, "eglQueryDisplayAttribKHR"))
+      return (__eglMustCastToProperFunctionPointerType)hook_eglQueryDisplayAttribEXT;
+
+   if (!strcmp(procname, "eglQueryDeviceStringEXT"))
+      return (__eglMustCastToProperFunctionPointerType)hook_eglQueryDeviceStringEXT;
+
+   if (!strcmp(procname, "eglQueryDeviceAttribEXT"))
+      return (__eglMustCastToProperFunctionPointerType)hook_eglQueryDeviceAttribEXT;
 
    if (!strcmp(procname, "eglGetDisplay"))
       return (__eglMustCastToProperFunctionPointerType)eglGetDisplay;
