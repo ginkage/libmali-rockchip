@@ -344,7 +344,8 @@ EGLBoolean eglChooseConfig (EGLDisplay dpy, const EGLint *attrib_list, EGLConfig
    return _eglChooseConfig(dpy, list, configs, config_size, num_config);
 }
 
-/* Implement EGL_EXT_device_query and EGL_EXT_device_drm(_render_node)
+/* Implement EGL_EXT_device_base (EGL_EXT_device_enumeration and
+ * EGL_EXT_device_query) and EGL_EXT_device_drm(_render_node)
  *
  * libmali's EGL has no EGL devices, so a compositor cannot tell which DRM
  * device its buffers live on: mutter then offers zwp_linux_dmabuf_v1 version 3
@@ -354,6 +355,10 @@ EGLBoolean eglChooseConfig (EGLDisplay dpy, const EGLint *attrib_list, EGLConfig
  * The Mali GPU itself has no DRM device, but the buffers of every display are
  * dma-bufs shared through the display controller, so report that one: the
  * first DRM device that has a render node.
+ *
+ * EGL_EXT_device_base promises eglQueryDevicesEXT, and Xwayland's EGLStream
+ * backend calls it unchecked when the extension is advertised, so enumerate
+ * that same device there.
  */
 
 static struct {
@@ -386,6 +391,27 @@ probe_egl_device(void)
       }
       drmFreeDevice(&device);
    }
+}
+
+static EGLBoolean EGLAPIENTRY
+hook_eglQueryDevicesEXT(EGLint max_devices, EGLDeviceEXT *devices,
+                        EGLint *num_devices)
+{
+   probe_egl_device();
+
+   if (!num_devices || (devices && max_devices <= 0))
+      return EGL_FALSE;
+
+   if (!mali_egl_device.render[0]) {
+      *num_devices = 0;
+      return EGL_TRUE;
+   }
+
+   if (devices)
+      devices[0] = (EGLDeviceEXT)&mali_egl_device;
+
+   *num_devices = 1;
+   return EGL_TRUE;
 }
 
 static EGLBoolean EGLAPIENTRY
@@ -457,6 +483,9 @@ eglGetProcAddress(const char *procname)
 
    if (!strcmp(procname, "eglQueryString"))
       return (__eglMustCastToProperFunctionPointerType)eglQueryString;
+
+   if (!strcmp(procname, "eglQueryDevicesEXT"))
+      return (__eglMustCastToProperFunctionPointerType)hook_eglQueryDevicesEXT;
 
    if (!strcmp(procname, "eglQueryDisplayAttribEXT") ||
        !strcmp(procname, "eglQueryDisplayAttribKHR"))
